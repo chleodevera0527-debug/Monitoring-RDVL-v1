@@ -12,6 +12,7 @@ import time
 import re
 from contextlib import closing
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,6 +47,7 @@ _INITIALIZED = False
 _LOGIN_FAILURES = {}
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0") == "1"
 APP_SECRET = os.getenv("APP_SECRET", "").strip()
+APP_TIMEZONE = ZoneInfo("Asia/Manila")
 
 DBIntegrityError = PostgresIntegrityError if USE_POSTGRES and psycopg2 else sqlite3.IntegrityError
 
@@ -119,16 +121,28 @@ class DBConnection:
             return 0
         return self.connection.total_changes
 
+def now_dt():
+    """Return application time in Philippine Standard Time (UTC+08:00)."""
+    return datetime.now(APP_TIMEZONE)
+
+
 def now_iso():
-    return datetime.now().isoformat(timespec="seconds")
+    """Return a timezone-aware ISO timestamp in Philippine Standard Time."""
+    return now_dt().isoformat(timespec="seconds")
+
 
 def parse_dt(value):
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(str(value))
+        # Older records without an offset are interpreted as Philippine local time.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=APP_TIMEZONE)
+        return dt.astimezone(APP_TIMEZONE)
     except (TypeError, ValueError):
         return None
+
 
 def db():
     if USE_POSTGRES:
@@ -260,7 +274,7 @@ def install_database_guards(con):
       delivery_arrival,unloading_start,unloading_finish,delivery_departure,yard_dropped,yard_pullout,
       returned_port,tags,notes,updated_by ON trips
     WHEN NEW.updated_at=OLD.updated_at BEGIN
-      UPDATE trips SET updated_at=strftime('%Y-%m-%dT%H:%M:%S','now','localtime') WHERE id=NEW.id;
+      UPDATE trips SET updated_at=strftime('%Y-%m-%dT%H:%M:%S','now','+8 hours') || '+08:00' WHERE id=NEW.id;
     END;
     """)
 
@@ -512,7 +526,7 @@ BEGIN
             ELSE 'Dispatched' END;
         NEW.status := status_expected;
     END IF;
-    NEW.updated_at := COALESCE(NULLIF(NEW.updated_at,''), to_char(clock_timestamp(),'YYYY-MM-DD"T"HH24:MI:SS'));
+    NEW.updated_at := COALESCE(NULLIF(NEW.updated_at,''), to_char(clock_timestamp() AT TIME ZONE 'Asia/Manila','YYYY-MM-DD"T"HH24:MI:SS') || '+08:00');
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;""")
@@ -598,7 +612,7 @@ def clear_login_failures(username):
 def create_session(con, username):
     raw = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw.encode()).hexdigest()
-    expires = datetime.now() + timedelta(days=SESSION_DAYS)
+    expires = now_dt() + timedelta(days=SESSION_DAYS)
     con.execute("DELETE FROM sessions WHERE expires_at < ?", (now_iso(),))
     con.execute("INSERT INTO sessions(token_hash,username,expires_at,created_at) VALUES(?,?,?,?)",
                 (token_hash, username, expires.isoformat(timespec="seconds"), now_iso()))
@@ -649,7 +663,7 @@ def validate_trip(d):
         errors.append("Invalid status.")
 
     parsed = []
-    now = datetime.now()
+    now = now_dt()
     for key, label in TIMES:
         value = d.get(key)
         if value:
@@ -995,9 +1009,13 @@ def dashboard_data(con, q="", selected_status="", user=None):
         if selected_status and st != selected_status:
             continue
         d["display_status"] = st
-        latest_dt, latest_label = latest_milestone(d)
-        d["latest_label"] = latest_label
-        d["latest_time"] = latest_dt.isoformat(timespec="minutes") if latest_dt else ""
+
+        # Latest Update is the actual record update time, not the latest
+        # movement milestone time.
+        updated_dt = parse_dt(d.get("updated_at"))
+        d["latest_label"] = "Last updated"
+        d["latest_time"] = updated_dt.isoformat(timespec="minutes") if updated_dt else ""
+
         filtered.append(d)
     return rows, filtered, counts
 
@@ -1098,7 +1116,9 @@ def trip_form(row,user,error=""):
 
 
 def detail(row,user):
-    r=dict(row); status=effective_status(r); latest_dt,latest_label=latest_milestone(r)
+    r=dict(row); status=effective_status(r)
+    latest_dt=parse_dt(r.get("updated_at"))
+    latest_label="Last updated"
     events=''.join(f'<tr><td>{escape(label)}</td><td>{escape(fmt(r.get(k)))}</td></tr>' for k,label in TIMES)
     with closing(db()) as con:
         activity=con.execute("SELECT * FROM activity_log WHERE trip_id=? ORDER BY id DESC LIMIT 100",(r["id"],)).fetchall()
@@ -1133,7 +1153,7 @@ def analytics_page(user):
 def alerts_page(user):
     with closing(db()) as con:
         rows=visible_trips(con,user)
-    now=datetime.now(); alerts=[]
+    now=now_dt(); alerts=[]
     for d in rows:
         st=effective_status(d)
         if d.get("priority")=="Urgent" and st not in ("Completed","Returned to Port"):
@@ -1182,7 +1202,7 @@ def audit_page(user):
         user_names = {r["username"].casefold() for r in con2.execute("SELECT username FROM users").fetchall()}
         client_names = {r["name"].casefold() for r in con2.execute("SELECT name FROM clients").fetchall()}
         trucker_names = {r["name"].casefold() for r in con2.execute("SELECT name FROM truckers").fetchall()}
-    now = datetime.now()
+    now = now_dt()
     for d in rows:
         c=d.get("container_no",""); seen[c]=seen.get(c,0)+1
         expected=effective_status(d)
@@ -1540,7 +1560,7 @@ class Handler(BaseHTTPRequestHandler):
                     if locked.get(milestone):
                         con.rollback(); return self.send_html(layout("Already recorded",'<div class="error">That milestone has already been recorded.</div>',user),400)
                     stamp=now_iso()
-                    con.execute(f"UPDATE trips SET {milestone}=?,updated_at=?,updated_by=? WHERE id=? AND COALESCE({milestone},'')=''",(stamp,stamp,user["username"],ident))
+                    cur=con.execute(f"UPDATE trips SET {milestone}=?,updated_at=?,updated_by=? WHERE id=? AND COALESCE({milestone},'')=''",(stamp,stamp,user["username"],ident))
                     if cur.rowcount != 1:
                         con.rollback(); return self.send_html(layout("Already recorded",'<div class="error">That milestone has already been recorded.</div>',user),400)
                     log_activity(con,ident,"Milestone recorded",TIME_LABELS[milestone],user["username"])
