@@ -1,0 +1,6 @@
+.git/
+.vscode/
+.idea/
+*.db
+*.db-wal
+*.db-shm
